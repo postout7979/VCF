@@ -1,0 +1,211 @@
+## python hosting 실행 시, 실행 스크립트의 폴더에서 temapltes 폴더 아래 html 파일 위치
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivy Full Security Dashboard</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --primary: #2c3e50; --accent: #3498db; --bg: #f8f9fa;
+            --danger: #e74c3c; --warning: #f1c40f; --success: #2ecc71; --info: #95a5a6;
+        }
+        body { margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; background: var(--bg); color: #333; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+
+        .host-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+        .host-card {
+            background: white; border-radius: 10px; padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05); cursor: pointer;
+            transition: transform 0.2s; border-left: 5px solid var(--accent);
+        }
+        .host-card:hover { transform: translateY(-5px); }
+        .stat-row { display: flex; gap: 10px; margin-top: 15px; font-size: 0.9em; }
+        .stat-item { flex: 1; text-align: center; background: #fdfdfd; padding: 5px; border-radius: 5px; border: 1px solid #eee; }
+        .danger-text { color: var(--danger); font-weight: bold; }
+
+        /* Detail & Tabs */
+        #detail-view { display: none; background: white; border-radius: 10px; padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+        .detail-header { display: flex; justify-content: space-between; margin-bottom: 20px; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        .tabs { display: flex; border-bottom: 1px solid #ddd; background: #f1f1f1; margin-bottom: 20px; }
+        .tab-btn { flex: 1; padding: 15px; border: none; background: none; cursor: pointer; font-weight: 600; }
+        .tab-btn.active { background: white; color: var(--accent); border-bottom: 3px solid var(--accent); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+        th, td { padding: 10px; border-bottom: 1px solid #eee; text-align: left; }
+        th { background: #f8f9fa; }
+
+        /* Error Box */
+        .error-box { background: #fee; color: #c00; padding: 20px; border: 1px solid #fcc; border-radius: 5px; text-align: center; margin-top: 20px; }
+        .severity { padding: 3px 6px; border-radius: 4px; color: white; font-size: 0.8em; }
+        .sev-CRITICAL { background: #e74c3c; }
+        .sev-HIGH { background: #e67e22; }
+        .sev-MEDIUM { background: #f1c40f; color: #333; }
+        .sev-LOW { background: #3498db; }
+        .sev-UNKNOWN { background: #95a5a6; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div id="list-view">
+        <header>
+            <h1>🛡️ Trivy Security Center</h1>
+            <button onclick="loadHosts()" style="cursor:pointer; padding:8px 15px;">🔄 Refresh</button>
+        </header>
+        <div id="host-grid" class="host-grid">
+            <div style="text-align:center; padding:50px;">Loading data...</div>
+        </div>
+    </div>
+
+    <div id="detail-view">
+        <div class="detail-header">
+            <div>
+                <h2 id="dt-hostname" style="margin:0">Hostname</h2>
+                <small id="dt-meta" style="color:#666">Meta Info</small>
+            </div>
+            <button onclick="showList()" style="cursor:pointer; padding:5px 15px;">Back to List</button>
+        </div>
+
+        <div class="tabs">
+            <button class="tab-btn active" onclick="swTab('vuln')">Vulnerabilities</button>
+            <button class="tab-btn" onclick="swTab('misconf')">Misconfigs</button>
+            <button class="tab-btn" onclick="swTab('secret')">Secrets</button>
+            <button class="tab-btn" onclick="swTab('license')">Licenses</button>
+        </div>
+
+        <div id="tab-vuln" class="tab-content active">
+            <table><thead><tr><th>ID</th><th>Pkg</th><th>Sev</th><th>Cur</th><th>Fix</th><th>Title</th></tr></thead><tbody id="tb-vuln"></tbody></table>
+        </div>
+        <div id="tab-misconf" class="tab-content">
+            <table><thead><tr><th>Type</th><th>ID</th><th>Sev</th><th>Msg</th><th>Status</th></tr></thead><tbody id="tb-misconf"></tbody></table>
+        </div>
+        <div id="tab-secret" class="tab-content">
+            <table><thead><tr><th>Cat</th><th>Sev</th><th>File</th><th>Title</th></tr></thead><tbody id="tb-secret"></tbody></table>
+        </div>
+        <div id="tab-license" class="tab-content">
+            <table><thead><tr><th>Pkg</th><th>Lic</th><th>File</th><th>Sev</th></tr></thead><tbody id="tb-license"></tbody></table>
+        </div>
+    </div>
+</div>
+
+<script>
+    // API 주소 (동일 서버면 빈 값)
+    const API_BASE = '';
+
+    document.addEventListener('DOMContentLoaded', loadHosts);
+
+    async function loadHosts() {
+        const grid = document.getElementById('host-grid');
+        grid.innerHTML = '<div style="text-align:center; padding:50px; grid-column:1/-1;">Loading hosts...</div>';
+
+        try {
+            const res = await fetch(`${API_BASE}/api/scans`);
+            if (!res.ok) throw new Error(`Server Error (${res.status})`);
+
+            const hosts = await res.json();
+            grid.innerHTML = '';
+
+            if (hosts.length === 0) {
+                grid.innerHTML = '<div class="error-box">No scan data found.</div>';
+                return;
+            }
+
+            hosts.forEach(host => {
+                const card = document.createElement('div');
+                card.className = 'host-card';
+                card.onclick = () => loadDetail(host.id, host);
+
+                // [설명] Vulns는 'Detected Risks'(발견된 위험)임을 명시
+                card.innerHTML = `
+                    <h3>${host.hostname} <span style="font-size:0.7em; background:#eee; padding:2px 5px; border-radius:4px;">${host.os}</span></h3>
+                    <div style="font-size:0.85em; color:#666; margin-bottom:10px;">IP: ${host.ip} | ${host.date}</div>
+                    <div class="stat-row">
+                        <div class="stat-item">
+                            <span class="danger-text">${host.stats.vuln}</span>
+                            <div style="font-size:0.8em; color:#888;">Detected Vulns</div>
+                        </div>
+                        <div class="stat-item">
+                            <span style="color:#e67e22; font-weight:bold;">${host.stats.misconf}</span>
+                            <div style="font-size:0.8em; color:#888;">Misconfigs</div>
+                        </div>
+                        <div class="stat-item">
+                            <span style="color:#c0392b; font-weight:bold;">${host.stats.secret}</span>
+                            <div style="font-size:0.8em; color:#888;">Secrets</div>
+                        </div>
+                    </div>
+                `;
+                grid.appendChild(card);
+            });
+        } catch (e) {
+            console.error(e);
+            grid.innerHTML = `<div class="error-box" style="grid-column:1/-1;">Failed to load data.<br><small>${e.message}</small></div>`;
+        }
+    }
+
+    async function loadDetail(id, meta) {
+        document.getElementById('dt-hostname').textContent = meta.hostname;
+        document.getElementById('dt-meta').textContent = `IP: ${meta.ip} | OS: ${meta.os} | Scan: ${meta.date}`;
+
+        ['vuln','misconf','secret','license'].forEach(t => document.getElementById(`tb-${t}`).innerHTML = '<tr><td colspan="6">Loading...</td></tr>');
+
+        document.getElementById('list-view').style.display = 'none';
+        document.getElementById('detail-view').style.display = 'block';
+
+        try {
+            const res = await fetch(`${API_BASE}/api/scans/${id}/details`);
+            const data = await res.json();
+
+            // [수정 핵심] r.fix가 비어있으면 'No Fix Available' 표시
+            renderRows('tb-vuln', data.vulns, r => `
+                <td><b>${r.id}</b></td>
+                <td>${r.pkg}</td>
+                <td>${bg(r.sev)}</td>
+                <td>${r.cur}</td>
+                <td style="${!r.fix ? 'color:#aaa; font-style:italic;' : 'color:#27ae60; font-weight:bold;'}">
+                    ${r.fix ? r.fix : 'No Fix Yet'}
+                </td>
+                <td>${r.title}</td>
+            `);
+
+            renderRows('tb-misconf', data.misconfs, r => `<td>${r.type}</td><td>${r.id}</td><td>${bg(r.sev)}</td><td>${r.msg}</td><td>${r.status}</td>`);
+            renderRows('tb-secret', data.secrets, r => `<td>${r.category}</td><td>${bg(r.sev)}</td><td>${r.file}</td><td>${r.title}</td>`);
+            renderRows('tb-license', data.licenses, r => `<td>${r.pkg}</td><td>${r.lic}</td><td>${r.file}</td><td>${bg(r.sev)}</td>`);
+
+        } catch (e) {
+            alert("Failed to load details: " + e.message);
+        }
+    }
+
+    function renderRows(id, list, fn) {
+        const el = document.getElementById(id);
+        if (!list || list.length === 0) {
+            el.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#999;">No items found.</td></tr>';
+            return;
+        }
+        el.innerHTML = list.map(item => `<tr>${fn(item)}</tr>`).join('');
+    }
+
+    function bg(sev) {
+        return `<span class="severity sev-${sev}">${sev}</span>`;
+    }
+
+    function showList() {
+        document.getElementById('detail-view').style.display = 'none';
+        document.getElementById('list-view').style.display = 'block';
+    }
+
+    function swTab(id) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        event.target.classList.add('active');
+        document.getElementById(`tab-${id}`).classList.add('active');
+    }
+</script>
+
+</body>
+</html>
