@@ -1,0 +1,219 @@
+# VCF 운영 어시스턴트 PoC (조회 전용 RAG, 폐쇄망)
+#
+# 단독 구성(PAIS 미사용): LLM 서빙 + 임베딩 + Open WebUI(RAG/UI) + PGVector
+#   docker compose up -d
+#
+name: vcf-ai-assistant
+
+x-offline-env: &offline-env
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  HF_HOME: /tmp/hf
+
+services:
+  vllm-chat:
+    image: vllm/vllm-openai:${VLLM_TAG:-latest}
+    restart: unless-stopped
+    ipc: host
+    environment:
+      <<: *offline-env
+    command: >
+      --model /models/${LLM_DIR}
+      --served-model-name ${LLM_SERVED_NAME:-vcf-llm}
+      --max-model-len ${LLM_MAX_LEN:-32768}
+      --gpu-memory-utilization ${LLM_GPU_UTIL:-0.90}
+      --max-num-seqs ${LLM_MAX_SEQS:-16}
+      --tensor-parallel-size ${LLM_TP:-1}
+      --enable-auto-tool-choice --tool-call-parser ${LLM_TOOL_PARSER:-hermes}
+      --host 0.0.0.0 --port 8000
+    volumes:
+      - ./models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${LLM_TP:-1}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    networks: [backend]
+
+  # 임베딩(bge-m3). 10명 규모는 CPU 로 충분. GPU 사용 시 TEI_IMAGE 태그 변경.
+  tei-embed:
+    image: ${TEI_IMAGE}
+    restart: unless-stopped
+    command: >
+      --model-id /models/${EMBED_DIR}
+      --port 80
+    volumes:
+      - ./models:/models:ro
+    networks: [backend]
+
+  pgvector:
+    image: ${PGVECTOR_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: webui
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: webui
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webui -d webui"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OPENWEBUI_TAG:-main}
+    restart: unless-stopped
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      vllm-chat:
+        condition: service_healthy
+      tei-embed:
+        condition: service_started
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - webui-data:/app/backend/data
+      # 로컬 리랭커 모델(sentence-transformers) 마운트
+      - ./models/${RERANK_DIR}:/models/${RERANK_DIR}:ro
+    environment:
+      <<: *offline-env
+      OFFLINE_MODE: "true"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
+      DEFAULT_LOCALE: ko
+      DATABASE_URL: postgresql://webui:${POSTGRES_PASSWORD}@pgvector:5432/webui
+
+      # --- LLM 백엔드 (로컬 vLLM) ---
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://vllm-chat:8000/v1
+      OPENAI_API_KEY: local-not-used
+
+      # --- RAG ---
+      VECTOR_DB: pgvector
+      PGVECTOR_DB_URL: postgresql://webui:${POSTGRES_PASSWORD}@pgvector:5432/webui
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_EMBEDDING_MODEL: ${EMBED_SERVED_NAME:-bge-m3}
+      RAG_OPENAI_API_BASE_URL: http://tei-embed:80/v1
+      RAG_OPENAI_API_KEY: local-not-used
+      ENABLE_RAG_HYBRID_SEARCH: "true"
+      RAG_RERANKING_MODEL: /models/${RERANK_DIR}
+      CHUNK_SIZE: ${RAG_CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP: ${RAG_CHUNK_OVERLAP:-150}
+      RAG_TOP_K: ${RAG_TOP_K:-8}
+      RAG_TOP_K_RERANKER: ${RAG_TOP_K_RERANKER:-4}
+      RAG_RELEVANCE_THRESHOLD: ${RAG_RELEVANCE_THRESHOLD:-0.1}
+
+      # --- VCF Operations 실시간 조회 도구 서버 (profile ops). 최초 기동 시에만 적용(PersistentConfig),
+      #     이후 변경은 관리자 UI(설정 > 도구) 또는 ENABLE_PERSISTENT_CONFIG=false 필요
+      TOOL_SERVER_CONNECTIONS: '[{"type":"openapi","url":"http://ops-tools:8000","path":"openapi.json","auth_type":"bearer","key":"${OPS_TOOLS_API_KEY:-}","config":{"enable":true},"info":{"id":"vcf-ops","name":"VCF Operations (read-only)","description":"VCF Operations 실시간 상태/알림/지표 조회 (읽기 전용)"}}]'
+
+      # --- 조회 전용 / 폐쇄망 하드닝: 외부 통신, 실행, 도구 기능 비활성 ---
+      ENABLE_SIGNUP: "false"
+      ENABLE_RAG_WEB_SEARCH: "false"
+      ENABLE_CODE_EXECUTION: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_IMAGE_GENERATION: "false"
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_MESSAGE_RATING: "false"
+      # 보조 LLM 호출(제목/태그/자동완성) 비활성: GPU 낭비 방지
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "true"
+      ANONYMIZED_TELEMETRY: "false"
+    networks: [backend, frontend]
+
+  # ===== VCF Operations 연동 (하이브리드) : docker compose --profile ops up -d =====
+  # ops-tools : 질의 시점 실시간 조회 (OpenAPI 도구 서버, 읽기 전용 4개 함수) -> Open WebUI 가 tool 로 호출
+  # ops-sync  : 느리게 변하는 구조/속성만 주기적으로 Knowledge('VCF Ops Live') 색인
+  ops-tools:
+    profiles: ["ops"]
+    image: ${OPS_SYNC_IMAGE:-python:3.12-slim}
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "/app/scripts/ops_tools_server.py"]
+    environment:
+      VCFOPS_URL: ${VCFOPS_URL:-}
+      VCFOPS_USERNAME: ${VCFOPS_USERNAME:-}
+      VCFOPS_PASSWORD: ${VCFOPS_PASSWORD:-}
+      VCFOPS_AUTH_SOURCE: ${VCFOPS_AUTH_SOURCE:-}
+      VCFOPS_VERIFY_TLS: ${VCFOPS_VERIFY_TLS:-true}
+      VCFOPS_CA_FILE: ${VCFOPS_CA_FILE:-}
+      VCFOPS_TIMEOUT_SEC: ${VCFOPS_TIMEOUT_SEC:-60}
+      OPS_RESOURCE_KINDS: ${OPS_RESOURCE_KINDS:-VirtualMachine,HostSystem,ClusterComputeResource,Datastore}
+      OPS_MAX_RESOURCES_PER_KIND: ${OPS_MAX_RESOURCES_PER_KIND:-2000}
+      OPS_TOOL_STATS: ${OPS_TOOL_STATS:-cpu_usage_pct=cpu|usage_average,mem_usage_pct=mem|usage_average}
+      OPS_TOOL_PROPERTY_KEYS: ${OPS_TOOL_PROPERTY_KEYS:-summary|runtime|powerState,summary|parentCluster,summary|parentHost}
+      OPS_TOOL_MAX_LIMIT: ${OPS_TOOL_MAX_LIMIT:-50}
+      OPS_TOOL_CACHE_TTL_SEC: ${OPS_TOOL_CACHE_TTL_SEC:-60}
+      OPS_TOOLS_API_KEY: ${OPS_TOOLS_API_KEY:-}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [backend, frontend]   # frontend: VCF Operations(관리망) 도달용. 포트는 게시하지 않음
+
+  ops-sync:
+    profiles: ["ops"]
+    image: ${OPS_SYNC_IMAGE:-python:3.12-slim}
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "/app/scripts/ops_sync.py", "--loop"]
+    depends_on:
+      open-webui:
+        condition: service_started
+    environment:
+      VCFOPS_URL: ${VCFOPS_URL:-}
+      VCFOPS_USERNAME: ${VCFOPS_USERNAME:-}
+      VCFOPS_PASSWORD: ${VCFOPS_PASSWORD:-}
+      VCFOPS_AUTH_SOURCE: ${VCFOPS_AUTH_SOURCE:-}
+      VCFOPS_VERIFY_TLS: ${VCFOPS_VERIFY_TLS:-true}
+      VCFOPS_CA_FILE: ${VCFOPS_CA_FILE:-}
+      VCFOPS_TIMEOUT_SEC: ${VCFOPS_TIMEOUT_SEC:-60}
+      OPS_SYNC_INTERVAL_MIN: ${OPS_SYNC_INTERVAL_MIN:-360}
+      OPS_COLLECT: ${OPS_COLLECT:-inventory}
+      OPS_INDEX_LIVE_VALUES: ${OPS_INDEX_LIVE_VALUES:-false}
+      OPS_RESOURCE_KINDS: ${OPS_RESOURCE_KINDS:-VirtualMachine,HostSystem,ClusterComputeResource,Datastore}
+      OPS_STAT_KEYS: ${OPS_STAT_KEYS:-cpu|usage_average,mem|usage_average}
+      OPS_PROPERTY_KEYS: ${OPS_PROPERTY_KEYS:-summary|runtime|powerState,config|hardware|num_Cpu,config|hardware|memoryKB,summary|parentCluster,summary|parentHost}
+      OPS_MAX_RESOURCES_PER_KIND: ${OPS_MAX_RESOURCES_PER_KIND:-2000}
+      OPS_MAX_ALERTS: ${OPS_MAX_ALERTS:-2000}
+      OPS_CHUNK_ENTRIES: ${OPS_CHUNK_ENTRIES:-80}
+      OPS_STATE_FILE: /state/ops_hashes.json
+      WEBUI_URL: http://open-webui:8080
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./certs:/certs:ro
+      - opssync-state:/state
+    networks: [backend, frontend]   # frontend: VCF Operations(관리망) 도달용
+
+networks:
+  backend:
+    internal: true   # 외부 통신 차단
+  frontend: {}
+
+volumes:
+  pgdata:
+  webui-data:
+  opssync-state:
