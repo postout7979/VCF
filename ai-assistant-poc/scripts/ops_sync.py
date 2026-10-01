@@ -3,7 +3,9 @@
 
 - 읽기 전용: 토큰 발급(POST /auth/token/acquire), GET 조회, 그리고 조회용 bulk 'query' POST 만 허용합니다.
   그 외 쓰기성 호출은 클라이언트 레벨에서 차단됩니다. 계정도 VCF Operations 에서 읽기 전용 역할로 만드세요.
-- 시계열 전체가 아니라 "수집 시점의 스냅샷"(요약/활성 알림/인벤토리 상태·핵심 지표)을 색인합니다.
+- 하이브리드 운영: 기본값은 느리게 변하는 "구조/속성"(inventory)만 색인합니다. 헬스/활성 알림/지표 같은 실시간 값은
+  ops_tools_server.py(OpenAPI 도구 서버)가 질의 시점에 직접 조회합니다. 도구 없이 쓰려면
+  OPS_COLLECT=summary,alerts,inventory + OPS_INDEX_LIVE_VALUES=true + 짧은 주기로 실시간 값을 색인할 수도 있습니다.
 - 내용이 바뀐 문서만 교체(재임베딩)합니다. 수집 시각은 각 항목에 표기됩니다.
 
 설정은 모두 환경변수 (.env.example 참고). 표준 라이브러리만 사용.
@@ -17,153 +19,18 @@ import argparse
 import hashlib
 import json
 import os
-import re
-import ssl
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
+
+from opslib import (OpsClient, bulk_properties, bulk_stats, env, fmt_num, log, ms_to_iso,
+                    res_kind, res_name, resolve_names, split_csv)
 
 KB_OPS = "VCF Ops Live"
 PREFIX = "vcfops-"
 TS_TOKEN = "@@TS@@"
 BATCH = 100
-
-
-def env(name, default=""):
-    return os.environ.get(name, default).strip()
-
-
-def log(msg):
-    print(f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {msg}", flush=True)
-
-
-def split_csv(v):
-    return [x.strip() for x in v.split(",") if x.strip()]
-
-
-# ---------------------------------------------------------------- VCF Operations
-class OpsClient:
-    def __init__(self):
-        self.base = env("VCFOPS_URL").rstrip("/")
-        self.user = env("VCFOPS_USERNAME")
-        self.password = os.environ.get("VCFOPS_PASSWORD", "")
-        self.auth_source = env("VCFOPS_AUTH_SOURCE")
-        self.timeout = int(env("VCFOPS_TIMEOUT_SEC", "60"))
-        if not (self.base and self.user and self.password):
-            raise SystemExit("VCFOPS_URL / VCFOPS_USERNAME / VCFOPS_PASSWORD 환경변수가 필요합니다.")
-        if env("VCFOPS_VERIFY_TLS", "true").lower() in ("0", "false", "no"):
-            self.ctx = ssl._create_unverified_context()
-            log("경고: TLS 검증이 꺼져 있습니다 (VCFOPS_VERIFY_TLS=false).")
-        else:
-            ca = env("VCFOPS_CA_FILE")
-            if ca and not os.path.exists(ca):
-                log(f"경고: VCFOPS_CA_FILE({ca})이 없어 시스템 기본 CA를 사용합니다. 사설 CA면 ./certs/ 에 PEM 을 두세요.")
-                ca = None
-            self.ctx = ssl.create_default_context(cafile=ca or None)
-        self.token = None
-
-    def _http(self, method, path, params=None, body=None, auth=True):
-        url = self.base + "/suite-api/api" + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params, doseq=True)
-        headers = {"Accept": "application/json"}
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode()
-            headers["Content-Type"] = "application/json"
-        if auth:
-            headers["Authorization"] = f"OpenStackToken {self.token}"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=self.timeout, context=self.ctx) as r:
-            txt = r.read().decode()
-            return json.loads(txt) if txt else {}
-
-    def login(self):
-        body = {"username": self.user, "password": self.password}
-        if self.auth_source:
-            body["authSource"] = self.auth_source
-        self.token = self._http("POST", "/auth/token/acquire", body=body, auth=False)["token"]
-
-    def request(self, method, path, params=None, body=None):
-        # 읽기 전용 가드: GET, 또는 조회용 bulk query 만 허용
-        if method != "GET" and not (method == "POST" and path.endswith("/query")):
-            raise PermissionError(f"read-only 정책으로 차단: {method} {path}")
-        if not self.token:
-            self.login()
-        try:
-            return self._http(method, path, params, body)
-        except urllib.error.HTTPError as e:
-            if e.code != 401:
-                raise RuntimeError(f"{method} {path} -> {e.code}: {e.read().decode(errors='replace')[:300]}")
-            self.login()  # 토큰 만료 시 1회 재발급
-            return self._http(method, path, params, body)
-
-    def get(self, path, params=None):
-        return self.request("GET", path, params)
-
-    def paged(self, path, key, params=None, limit=None):
-        out, page, size = [], 0, 1000
-        while True:
-            p = dict(params or {}, page=page, pageSize=size)
-            data = self.get(path, p)
-            items = data.get(key, []) or []
-            out.extend(items)
-            total = (data.get("pageInfo") or {}).get("totalCount", len(out))
-            if len(items) < size or len(out) >= total or (limit and len(out) >= limit):
-                break
-            page += 1
-        return out[:limit] if limit else out
-
-
-def ms_to_iso(ms):
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-    except (TypeError, ValueError):
-        return "-"
-
-
-def last_value(item):
-    """stat/property 항목에서 최신 값 추출 (응답 형태 차이에 관대하게)."""
-    vals = item.get("values") or item.get("data") or []
-    return vals[-1] if vals else None
-
-
-def fmt_num(v):
-    if isinstance(v, float):
-        return f"{v:.1f}"
-    return str(v)
-
-
-def bulk_properties(ops, ids, keys):
-    """{resourceId: {key: value}}"""
-    res = {}
-    for i in range(0, len(ids), BATCH):
-        data = ops.request("POST", "/resources/properties/latest/query",
-                           body={"resourceIds": ids[i:i + BATCH], "propertyKeys": keys})
-        for v in data.get("values", []):
-            contents = (v.get("property-contents") or {}).get("property-content", [])
-            res[v.get("resourceId")] = {c.get("statKey"): last_value(c) for c in contents}
-    return res
-
-
-def bulk_stats(ops, ids, keys):
-    res = {}
-    for i in range(0, len(ids), BATCH):
-        data = ops.request("POST", "/resources/stats/latest/query",
-                           body={"resourceId": ids[i:i + BATCH], "statKey": keys, "currentOnly": True})
-        for v in data.get("values", []):
-            stats = (v.get("stat-list") or {}).get("stat", [])
-            out = {}
-            for s in stats:
-                k = (s.get("statKey") or {}).get("key")
-                if k:
-                    out[k] = last_value(s)
-            res[v.get("resourceId")] = out
-    return res
 
 
 # ---------------------------------------------------------------- 문서 생성
@@ -172,20 +39,15 @@ def header(title, desc):
             f"{desc}\n\n")
 
 
-def res_name(r):
-    return (r.get("resourceKey") or {}).get("name") or r.get("identifier", "?")
-
-
-def res_kind(r):
-    return (r.get("resourceKey") or {}).get("resourceKindKey", "?")
-
-
 def collect_inventory(ops):
     """kind 별 문서 {파일명: 본문(@@TS@@ 포함)}, 요약용 카운터, id→이름 맵."""
     kinds = split_csv(env("OPS_RESOURCE_KINDS", "VirtualMachine,HostSystem,ClusterComputeResource,Datastore"))
-    stat_keys = split_csv(env("OPS_STAT_KEYS", "cpu|usage_average,mem|usage_average"))
+    # 하이브리드 기본: 색인에는 "구조/속성"만 넣고, 헬스/지표 같은 실시간 값은 ops-tools 가 질의 시점에 조회
+    live = env("OPS_INDEX_LIVE_VALUES", "false").lower() in ("1", "true", "yes")
+    stat_keys = split_csv(env("OPS_STAT_KEYS", "cpu|usage_average,mem|usage_average")) if live else []
     prop_keys = split_csv(env("OPS_PROPERTY_KEYS",
-                              "summary|runtime|powerState,config|hardware|num_Cpu,config|hardware|memoryKB"))
+                              "summary|runtime|powerState,config|hardware|num_Cpu,config|hardware|memoryKB,"
+                              "summary|parentCluster,summary|parentHost"))
     max_n = int(env("OPS_MAX_RESOURCES_PER_KIND", "2000"))
     per_file = int(env("OPS_CHUNK_ENTRIES", "80"))
 
@@ -214,29 +76,27 @@ def collect_inventory(ops):
             names[rid] = res_name(r)
             kv = {k: v for k, v in {**props.get(rid, {}), **stats.get(rid, {})}.items() if v is not None}
             extra = ", ".join(f"{k}={fmt_num(v)}" for k, v in kv.items())
-            entries.append(f"- [{kind}] {res_name(r)} — health={r.get('resourceHealth', '-')}"
-                           f", status={','.join(s.get('resourceState', '') for s in r.get('resourceStatusStates', [])) or '-'}"
-                           + (f", {extra}" if extra else "") + f" (수집 {TS_TOKEN})")
+            live_txt = (f", health={r.get('resourceHealth', '-')}, status="
+                        f"{','.join(s.get('resourceState', '') for s in r.get('resourceStatusStates', [])) or '-'}") if live else ""
+            entries.append(f"- [{kind}] {res_name(r)}" + live_txt
+                           + (f" — {extra}" if extra and not live else (f", {extra}" if extra else ""))
+                           + f" (수집 {TS_TOKEN})")
         for n, i in enumerate(range(0, max(len(entries), 1), per_file), 1):
             chunk = entries[i:i + per_file]
             if not chunk:
                 continue
             docs[f"{PREFIX}inventory-{kind}-{n:03d}.md"] = (
                 header(f"VCF Operations 인벤토리: {kind} ({n}번째 묶음)",
-                       f"각 항목은 수집 시점의 상태 스냅샷입니다. 지표 단위는 VCF Operations 기준(예: usage_average=%).")
+                       "각 항목은 수집 시점의 구조/속성 스냅샷입니다. "
+                       + ("헬스/상태/지표 값이 포함됩니다 (usage_average=%)."
+                          if live else "헬스·알림·사용률 같은 실시간 값은 포함하지 않으며 도구(ops-tools)로 조회해야 합니다."))
                 + "\n".join(chunk) + "\n")
     return docs, counters, names
 
 
 def collect_alerts(ops, names):
     alerts = ops.paged("/alerts", "alerts", {"activeOnly": "true"}, limit=int(env("OPS_MAX_ALERTS", "2000")))
-    missing = list({a.get("resourceId") for a in alerts} - set(names))
-    for i in range(0, len(missing), BATCH):
-        try:
-            for r in ops.get("/resources", {"resourceId": missing[i:i + BATCH], "pageSize": BATCH}).get("resourceList", []):
-                names[r["identifier"]] = res_name(r)
-        except Exception as e:
-            log(f"알림 대상 이름 조회 실패: {e}")
+    resolve_names(ops, [a.get("resourceId") for a in alerts], names)
     order = {"CRITICAL": 0, "IMMEDIATE": 1, "WARNING": 2, "INFORMATION": 3}
     alerts.sort(key=lambda a: (order.get(a.get("alertLevel"), 9), -(a.get("startTimeUTC") or 0)))
     lines = []
@@ -261,7 +121,7 @@ def build_summary(counters, alert_counter):
 
 
 def generate_docs(ops):
-    collect = set(split_csv(env("OPS_COLLECT", "summary,alerts,inventory")))
+    collect = set(split_csv(env("OPS_COLLECT", "inventory")))
     docs, counters, names, alert_counter = {}, {}, {}, None
     if collect & {"inventory", "summary"}:
         d, counters, names = collect_inventory(ops)
@@ -368,7 +228,7 @@ def main():
         return discover(args.discover)
     if not args.loop:
         return run_once(args)
-    interval = max(5, int(env("OPS_SYNC_INTERVAL_MIN", "60"))) * 60
+    interval = max(5, int(env("OPS_SYNC_INTERVAL_MIN", "360"))) * 60
     while True:
         try:
             run_once(args)

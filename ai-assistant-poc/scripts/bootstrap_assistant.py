@@ -3,7 +3,8 @@
 
 표준 라이브러리만 사용합니다 (폐쇄망 호환). 여러 번 실행해도 안전합니다
 (Knowledge/모델은 이름·ID 로 재사용, 파일은 이미 올린 파일명은 건너뜁니다).
-모델 프리셋에는 'VCF Docs'(정적 문서)와 'VCF Ops Live'(VCF Operations 수집 데이터) 두 Knowledge 가 연결됩니다.
+모델 프리셋에는 'VCF Docs'(정적 문서)와 'VCF Ops Live'(VCF Operations 구조/속성 색인) 두 Knowledge,
+그리고 실시간 조회 도구(ops-tools, 읽기 전용)가 연결됩니다.
 
 사용법:
   python3 scripts/bootstrap_assistant.py \
@@ -30,6 +31,9 @@ def main():
     ap.add_argument("--docs", default="docs_src")
     ap.add_argument("--base-model", default="vcf-llm", help="LLM_SERVED_NAME")
     ap.add_argument("--prompt", default="prompts/system_prompt_ko.txt")
+    ap.add_argument("--tool-id", default="server:vcf-ops",
+                    help="Open WebUI 도구 서버 ID (compose 의 TOOL_SERVER_CONNECTIONS info.id). 사용 안 하면 --no-tools")
+    ap.add_argument("--no-tools", action="store_true", help="도구 연결 없이 RAG 전용으로 생성")
     a = ap.parse_args()
 
     ow = OWUI(a.url, a.email, a.password)
@@ -55,16 +59,16 @@ def main():
         ow.wait_processed(fid)
         ow.add_file(docs_id, fid)
 
-    # 3) 모델 프리셋 (시스템 프롬프트 + Knowledge 고정, 도구 없음 = 조회 전용)
+    # 3) 모델 프리셋 (시스템 프롬프트 + Knowledge 고정 + 읽기 전용 VCF Ops 도구)
     with open(a.prompt, encoding="utf-8") as f:
         system = f.read().strip()
     payload = {
         "id": MODEL_ID,
         "name": "VCF 운영 어시스턴트",
         "base_model_id": a.base_model,
-        "params": {"system": system, "temperature": 0.2},
+        "params": {"system": system, "temperature": 0.2, **({} if a.no_tools else {"function_calling": "native"})},
         "meta": {"description": "VCF 문서 + VCF Operations 수집 데이터 기반 조회 전용 어시스턴트",
-                 "knowledge": [ow.knowledge(docs_id), ow.knowledge(ops_id)], "toolIds": []},
+                 "knowledge": [ow.knowledge(docs_id), ow.knowledge(ops_id)], "toolIds": [] if a.no_tools else [a.tool_id]},
         "access_control": None,
         "is_active": True,
     }

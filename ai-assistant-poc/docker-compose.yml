@@ -24,6 +24,7 @@ services:
       --gpu-memory-utilization ${LLM_GPU_UTIL:-0.90}
       --max-num-seqs ${LLM_MAX_SEQS:-16}
       --tensor-parallel-size ${LLM_TP:-1}
+      --enable-auto-tool-choice --tool-call-parser ${LLM_TOOL_PARSER:-hermes}
       --host 0.0.0.0 --port 8000
     volumes:
       - ./models:/models:ro
@@ -115,6 +116,10 @@ services:
       RAG_TOP_K_RERANKER: ${RAG_TOP_K_RERANKER:-4}
       RAG_RELEVANCE_THRESHOLD: ${RAG_RELEVANCE_THRESHOLD:-0.1}
 
+      # --- VCF Operations 실시간 조회 도구 서버 (profile ops). 최초 기동 시에만 적용(PersistentConfig),
+      #     이후 변경은 관리자 UI(설정 > 도구) 또는 ENABLE_PERSISTENT_CONFIG=false 필요
+      TOOL_SERVER_CONNECTIONS: '[{"type":"openapi","url":"http://ops-tools:8000","path":"openapi.json","auth_type":"bearer","key":"${OPS_TOOLS_API_KEY:-}","config":{"enable":true},"info":{"id":"vcf-ops","name":"VCF Operations (read-only)","description":"VCF Operations 실시간 상태/알림/지표 조회 (읽기 전용)"}}]'
+
       # --- 조회 전용 / 폐쇄망 하드닝: 외부 통신, 실행, 도구 기능 비활성 ---
       ENABLE_SIGNUP: "false"
       ENABLE_RAG_WEB_SEARCH: "false"
@@ -133,8 +138,40 @@ services:
       ANONYMIZED_TELEMETRY: "false"
     networks: [backend, frontend]
 
-  # VCF Operations(Suite API) 읽기 전용 수집 -> Open WebUI Knowledge('VCF Ops Live') 색인
-  #   docker compose --profile ops up -d
+  # ===== VCF Operations 연동 (하이브리드) : docker compose --profile ops up -d =====
+  # ops-tools : 질의 시점 실시간 조회 (OpenAPI 도구 서버, 읽기 전용 4개 함수) -> Open WebUI 가 tool 로 호출
+  # ops-sync  : 느리게 변하는 구조/속성만 주기적으로 Knowledge('VCF Ops Live') 색인
+  ops-tools:
+    profiles: ["ops"]
+    image: ${OPS_SYNC_IMAGE:-python:3.12-slim}
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "/app/scripts/ops_tools_server.py"]
+    environment:
+      VCFOPS_URL: ${VCFOPS_URL:-}
+      VCFOPS_USERNAME: ${VCFOPS_USERNAME:-}
+      VCFOPS_PASSWORD: ${VCFOPS_PASSWORD:-}
+      VCFOPS_AUTH_SOURCE: ${VCFOPS_AUTH_SOURCE:-}
+      VCFOPS_VERIFY_TLS: ${VCFOPS_VERIFY_TLS:-true}
+      VCFOPS_CA_FILE: ${VCFOPS_CA_FILE:-}
+      VCFOPS_TIMEOUT_SEC: ${VCFOPS_TIMEOUT_SEC:-60}
+      OPS_RESOURCE_KINDS: ${OPS_RESOURCE_KINDS:-VirtualMachine,HostSystem,ClusterComputeResource,Datastore}
+      OPS_MAX_RESOURCES_PER_KIND: ${OPS_MAX_RESOURCES_PER_KIND:-2000}
+      OPS_TOOL_STATS: ${OPS_TOOL_STATS:-cpu_usage_pct=cpu|usage_average,mem_usage_pct=mem|usage_average}
+      OPS_TOOL_PROPERTY_KEYS: ${OPS_TOOL_PROPERTY_KEYS:-summary|runtime|powerState,summary|parentCluster,summary|parentHost}
+      OPS_TOOL_MAX_LIMIT: ${OPS_TOOL_MAX_LIMIT:-50}
+      OPS_TOOL_CACHE_TTL_SEC: ${OPS_TOOL_CACHE_TTL_SEC:-60}
+      OPS_TOOLS_API_KEY: ${OPS_TOOLS_API_KEY:-}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks: [backend, frontend]   # frontend: VCF Operations(관리망) 도달용. 포트는 게시하지 않음
+
   ops-sync:
     profiles: ["ops"]
     image: ${OPS_SYNC_IMAGE:-python:3.12-slim}
@@ -152,11 +189,12 @@ services:
       VCFOPS_VERIFY_TLS: ${VCFOPS_VERIFY_TLS:-true}
       VCFOPS_CA_FILE: ${VCFOPS_CA_FILE:-}
       VCFOPS_TIMEOUT_SEC: ${VCFOPS_TIMEOUT_SEC:-60}
-      OPS_SYNC_INTERVAL_MIN: ${OPS_SYNC_INTERVAL_MIN:-60}
-      OPS_COLLECT: ${OPS_COLLECT:-summary,alerts,inventory}
+      OPS_SYNC_INTERVAL_MIN: ${OPS_SYNC_INTERVAL_MIN:-360}
+      OPS_COLLECT: ${OPS_COLLECT:-inventory}
+      OPS_INDEX_LIVE_VALUES: ${OPS_INDEX_LIVE_VALUES:-false}
       OPS_RESOURCE_KINDS: ${OPS_RESOURCE_KINDS:-VirtualMachine,HostSystem,ClusterComputeResource,Datastore}
       OPS_STAT_KEYS: ${OPS_STAT_KEYS:-cpu|usage_average,mem|usage_average}
-      OPS_PROPERTY_KEYS: ${OPS_PROPERTY_KEYS:-summary|runtime|powerState,config|hardware|num_Cpu,config|hardware|memoryKB}
+      OPS_PROPERTY_KEYS: ${OPS_PROPERTY_KEYS:-summary|runtime|powerState,config|hardware|num_Cpu,config|hardware|memoryKB,summary|parentCluster,summary|parentHost}
       OPS_MAX_RESOURCES_PER_KIND: ${OPS_MAX_RESOURCES_PER_KIND:-2000}
       OPS_MAX_ALERTS: ${OPS_MAX_ALERTS:-2000}
       OPS_CHUNK_ENTRIES: ${OPS_CHUNK_ENTRIES:-80}
