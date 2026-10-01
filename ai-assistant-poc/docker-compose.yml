@@ -133,6 +133,43 @@ services:
       ANONYMIZED_TELEMETRY: "false"
     networks: [backend, frontend]
 
+  # VCF Operations(Suite API) 읽기 전용 수집 -> Open WebUI Knowledge('VCF Ops Live') 색인
+  #   docker compose --profile ops up -d
+  ops-sync:
+    profiles: ["ops"]
+    image: ${OPS_SYNC_IMAGE:-python:3.12-slim}
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "/app/scripts/ops_sync.py", "--loop"]
+    depends_on:
+      open-webui:
+        condition: service_started
+    environment:
+      VCFOPS_URL: ${VCFOPS_URL:-}
+      VCFOPS_USERNAME: ${VCFOPS_USERNAME:-}
+      VCFOPS_PASSWORD: ${VCFOPS_PASSWORD:-}
+      VCFOPS_AUTH_SOURCE: ${VCFOPS_AUTH_SOURCE:-}
+      VCFOPS_VERIFY_TLS: ${VCFOPS_VERIFY_TLS:-true}
+      VCFOPS_CA_FILE: ${VCFOPS_CA_FILE:-}
+      VCFOPS_TIMEOUT_SEC: ${VCFOPS_TIMEOUT_SEC:-60}
+      OPS_SYNC_INTERVAL_MIN: ${OPS_SYNC_INTERVAL_MIN:-60}
+      OPS_COLLECT: ${OPS_COLLECT:-summary,alerts,inventory}
+      OPS_RESOURCE_KINDS: ${OPS_RESOURCE_KINDS:-VirtualMachine,HostSystem,ClusterComputeResource,Datastore}
+      OPS_STAT_KEYS: ${OPS_STAT_KEYS:-cpu|usage_average,mem|usage_average}
+      OPS_PROPERTY_KEYS: ${OPS_PROPERTY_KEYS:-summary|runtime|powerState,config|hardware|num_Cpu,config|hardware|memoryKB}
+      OPS_MAX_RESOURCES_PER_KIND: ${OPS_MAX_RESOURCES_PER_KIND:-2000}
+      OPS_MAX_ALERTS: ${OPS_MAX_ALERTS:-2000}
+      OPS_CHUNK_ENTRIES: ${OPS_CHUNK_ENTRIES:-80}
+      OPS_STATE_FILE: /state/ops_hashes.json
+      WEBUI_URL: http://open-webui:8080
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./certs:/certs:ro
+      - opssync-state:/state
+    networks: [backend, frontend]   # frontend: VCF Operations(관리망) 도달용
+
 networks:
   backend:
     internal: true   # 외부 통신 차단
@@ -141,3 +178,4 @@ networks:
 volumes:
   pgdata:
   webui-data:
+  opssync-state:

@@ -90,7 +90,62 @@ python3 scripts/bootstrap_assistant.py \
 
 운영 시 직접 챙겨야 할 것 (PAIS가 해 주던 부분): GPU 드라이버/Container Toolkit 관리, 이미지·모델 버전 고정과 반입 검증, 사용자 인증(필요 시 LDAP/OIDC 연동), 백업, 접근 로그/감사. VM에 올릴 경우 GPU는 vGPU 또는 DirectPath I/O 패스스루로 연결합니다.
 
-## 6. 운영/보안 체크리스트
+## 6. VCF Operations 연동 (API 수집 → 색인 → 답변)
+
+VCF Operations(Suite API)에서 가져온 환경 데이터를 문서로 변환해 Open WebUI Knowledge **"VCF Ops Live"** 에 주기적으로 색인합니다. 모델 프리셋에는 `VCF Docs`(정적 문서)와 `VCF Ops Live` 가 함께 연결되므로, "지금 CRITICAL 알림이 뭐야?", "ESXi 호스트 헬스 요약해줘" 같은 질의에 수집 데이터로 답하고 원인·조치는 공식 문서로 설명합니다.
+
+```
+VCF Operations ──(GET/조회 query, 읽기전용)──> ops-sync ──(문서화: 요약/알림/인벤토리)──> Open WebUI Knowledge
+   Suite API                                  (60분 주기)                                  'VCF Ops Live' ──> 임베딩 ──> PGVector ──> 답변
+```
+
+### 6.1 환경 변수 (`.env`)
+
+| 변수 | 설명 | 기본값 |
+|---|---|---|
+| `VCFOPS_URL` | VCF Operations 주소 (예: `https://vcf-ops.example.local`) | (필수) |
+| `VCFOPS_USERNAME` / `VCFOPS_PASSWORD` | **읽기 전용 역할** 전용 계정 | (필수) |
+| `VCFOPS_AUTH_SOURCE` | 외부 인증 소스명 (로컬 계정이면 비움) | 빈 값 |
+| `VCFOPS_VERIFY_TLS` / `VCFOPS_CA_FILE` | TLS 검증, 사설 CA PEM 경로(`./certs/`에 두고 `/certs/…`로 지정) | `true` / `/certs/vcfops-ca.pem` |
+| `OPS_SYNC_INTERVAL_MIN` | 수집 주기(분, 최소 5) | `60` |
+| `OPS_COLLECT` | `summary`, `alerts`, `inventory` 중 선택 | 전부 |
+| `OPS_RESOURCE_KINDS` | 수집할 리소스 종류 | `VirtualMachine,HostSystem,ClusterComputeResource,Datastore` |
+| `OPS_STAT_KEYS` | 포함할 최신 지표 키 | `cpu\|usage_average,mem\|usage_average` |
+| `OPS_PROPERTY_KEYS` | 포함할 속성 키 | `summary\|runtime\|powerState,config\|hardware\|num_Cpu,config\|hardware\|memoryKB` |
+| `OPS_MAX_RESOURCES_PER_KIND`, `OPS_MAX_ALERTS`, `OPS_CHUNK_ENTRIES` | 수집 상한, 문서 1개당 항목 수 | `2000`, `2000`, `80` |
+
+### 6.2 사용 절차
+```bash
+# 1) VCF Operations 에서 읽기 전용 계정 생성 후 .env 에 입력, 사설 CA 는 certs/ 에 배치
+# 2) bootstrap 을 한 번 실행해 'VCF Ops Live' Knowledge 가 모델 프리셋에 연결되도록 함 (3.3 절)
+# 3) 사용 가능한 키 확인 (컨테이너 밖에서, 환경변수 로드 후)
+set -a; . ./.env; set +a
+python3 scripts/ops_sync.py --discover VirtualMachine
+# 4) 검증: Open WebUI 를 건드리지 않고 ./ops_out/ 에 생성될 문서만 확인
+python3 scripts/ops_sync.py --dry-run
+# 5) 상시 동기화 기동
+docker compose --profile ops up -d ops-sync
+docker compose logs -f ops-sync          # "색인 완료: 교체 N, 변경없음 M, 삭제 K"
+```
+
+### 6.3 색인되는 문서 (파일명 `vcfops-*.md`)
+- `vcfops-summary.md` — 종류별 헬스 분포, 활성 알림 분포
+- `vcfops-alerts-active.md` — 활성 알림 (심각도 순: 정의명, 대상, 상태, 발생 시각)
+- `vcfops-inventory-<종류>-NNN.md` — 리소스별 한 줄 항목(헬스/상태/속성/최신 지표). 항목마다 종류와 수집 시각이 들어 있어 어느 청크가 검색돼도 문맥이 유지됩니다.
+
+동작 방식: 문서 내용(수집 시각 제외)의 해시가 바뀐 파일만 교체해 재임베딩 비용을 줄이고, 더는 생성되지 않는 `vcfops-*` 문서는 자동 삭제합니다. 수집이 통째로 실패하면 기존 색인을 유지합니다.
+
+### 6.4 설계상 한계와 주의
+- **스냅샷 기반**: 시계열 전체는 색인하지 않습니다. 시스템 프롬프트가 답변에 수집 시각을 밝히도록 했지만, 주기(기본 60분) 이내의 변화는 반영되지 않습니다. "최근 1주일 추이" 같은 질의는 이 방식으로 답할 수 없습니다.
+- **조회 전용 보장**: 클라이언트가 GET과 조회용 `…/query` POST, 토큰 발급 외 호출을 코드 레벨에서 차단합니다. 계정 권한도 읽기 전용으로 제한하세요.
+- **민감 정보**: 수집 항목은 키 allowlist(`OPS_STAT_KEYS`, `OPS_PROPERTY_KEYS`)로만 제한됩니다. 호스트명·VM명이 외부로 나가지는 않지만 Open WebUI 사용자에게는 모두 보이므로, 권한이 다른 사용자가 있다면 수집 종류를 줄이거나 Knowledge 접근 제어를 설정하세요.
+- **규모**: 종류당 기본 2000개 상한입니다. VM이 수천 개 이상이면 상한, 주기, 수집 종류를 조정하세요(전체 재임베딩은 TEI CPU 사용량이 큽니다).
+- **계정 비밀번호**: `.env` 평문 저장입니다. 권한 600과 접근 통제를 적용하세요.
+- **관리자 계정 재사용**: ops-sync 는 Open WebUI 관리자 계정으로 API를 호출합니다. 운영 전환 시 전용 계정/API 키로 분리하세요.
+
+> **검증 상태**: ops_sync.py 는 VCF Operations 를 모사한 **목(mock) 서버**로 동작을 확인했습니다(문서 생성, 변경 감지 교체, 읽기 전용 차단). 목 서버는 제가 알고 있는 Suite API 응답 형태를 가정한 것이므로, **실제 VCF Operations 9.1.1 에서의 엔드포인트/응답 필드/지표 키는 검증하지 못했습니다.** 처음에는 `--discover` 와 `--dry-run` 으로 결과를 확인하고, 실패하는 수집기는 경고만 남기고 건너뛰도록 되어 있으니 로그를 확인하세요. 사용 엔드포인트: `/suite-api/api/auth/token/acquire`, `/resources`, `/alerts`, `/resources/properties/latest/query`, `/resources/stats/latest/query`, `/resources/{id}/statkeys`, `/resources/{id}/properties`.
+
+## 7. 운영/보안 체크리스트
 
 - [ ] `.env`의 기본 비밀번호 변경, `.env` 권한 600, 저장소에 커밋 금지(`.gitignore` 처리됨)
 - [ ] Open WebUI 앞단에 사내 TLS 종단(리버스 프록시) 적용 — 현재는 HTTP
@@ -99,7 +154,7 @@ python3 scripts/bootstrap_assistant.py \
 - [ ] 답변에 출처·버전 표기 확인, 근거 없을 때 "확인할 수 없음" 응답 확인
 - [ ] 변경 작업은 어시스턴트 범위 밖: 절차 안내만 하고 실행은 기존 변경관리 절차로
 
-## 7. 트러블슈팅
+## 8. 트러블슈팅
 
 | 증상 | 점검 |
 |---|---|
@@ -108,6 +163,7 @@ python3 scripts/bootstrap_assistant.py \
 | 업로드한 문서가 검색 안 됨 | 임베딩 엔드포인트 확인, 로그의 처리 실패 여부, 스캔 PDF(OCR 필요) 여부 |
 | 리랭커 로딩 실패 | `models/bge-reranker-v2-m3` 마운트 경로 확인, 오프라인 모드에서 외부 다운로드 시도 로그 확인 |
 | 한국어 답변에 영어 섞임 | 시스템 프롬프트 규칙 1 강화, 모델 교체 평가 |
+| `ops_sync` 가 "수집 실패/건너뜀" 로그 | `--discover` 로 실제 키 확인, 계정 권한/TLS(`VCFOPS_CA_FILE`) 확인 |
 | `bootstrap_assistant.py` API 오류 | Open WebUI 버전에 따라 API 스키마가 다름 — 오류 메시지의 엔드포인트를 해당 버전 `/docs`(Swagger)와 대조해 수정 |
 
 ## 파일 구성
@@ -117,11 +173,14 @@ ai-assistant-poc/
 ├── docker-compose.yml          # 서비스 정의 
 ├── .env.example                # 설정 템플릿 (복사해서 .env 사용)
 ├── prompts/system_prompt_ko.txt
+├── certs/                      # VCF Operations 사설 CA PEM (git 제외)
 ├── docs_src/                   # RAG 색인 대상 문서
 ├── models/                     # 모델 가중치 (git 제외)
 └── scripts/
     ├── prepare_offline.sh      # 반입 번들 생성 (인터넷 호스트)
     ├── load_offline.sh         # 해시 검증 + 이미지 로드 (폐쇄망)
     ├── smoke_test.sh           # 기동 후 확인
-    └── bootstrap_assistant.py  # Knowledge/모델 프리셋 자동 구성
+    ├── bootstrap_assistant.py  # Knowledge/모델 프리셋 자동 구성
+    ├── ops_sync.py             # VCF Operations 수집 -> Knowledge 색인
+    └── owui.py                 # Open WebUI API 클라이언트 (공용)
 ```

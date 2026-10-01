@@ -11,6 +11,7 @@ IMAGES=(
   "ghcr.io/open-webui/open-webui:${OPENWEBUI_TAG}"
   "${TEI_IMAGE}"
   "${PGVECTOR_IMAGE}"
+  "${OPS_SYNC_IMAGE}"
 )
 mkdir -p images models
 for img in "${IMAGES[@]}"; do docker pull "$img"; done
