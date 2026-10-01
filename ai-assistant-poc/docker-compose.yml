@@ -1,8 +1,7 @@
 # VCF 운영 어시스턴트 PoC (조회 전용 RAG, 폐쇄망)
 #
-#   LLM 서빙 + 임베딩 + Open WebUI(RAG/UI) + PGVector
-#   - 기본:   docker compose --profile local-llm --profile local-embed up -d
-#   - PAIS 엔드포인트 사용(LLM/임베딩을 PAIS 에 위임):  docker compose up -d   (profile 없이)
+# 단독 구성(PAIS 미사용): LLM 서빙 + 임베딩 + Open WebUI(RAG/UI) + PGVector
+#   docker compose up -d
 #
 name: vcf-ai-assistant
 
@@ -13,7 +12,6 @@ x-offline-env: &offline-env
 
 services:
   vllm-chat:
-    profiles: ["local-llm"]
     image: vllm/vllm-openai:${VLLM_TAG:-latest}
     restart: unless-stopped
     ipc: host
@@ -46,7 +44,6 @@ services:
 
   # 임베딩(bge-m3). 10명 규모는 CPU 로 충분. GPU 사용 시 TEI_IMAGE 태그 변경.
   tei-embed:
-    profiles: ["local-embed"]
     image: ${TEI_IMAGE}
     restart: unless-stopped
     command: >
@@ -78,6 +75,10 @@ services:
     depends_on:
       pgvector:
         condition: service_healthy
+      vllm-chat:
+        condition: service_healthy
+      tei-embed:
+        condition: service_started
     ports:
       - "${WEBUI_PORT:-3000}:8080"
     volumes:
@@ -93,19 +94,19 @@ services:
       DEFAULT_LOCALE: ko
       DATABASE_URL: postgresql://webui:${POSTGRES_PASSWORD}@pgvector:5432/webui
 
-      # --- LLM 백엔드 (로컬 vLLM 또는 PAIS Model Endpoint) ---
+      # --- LLM 백엔드 (로컬 vLLM) ---
       ENABLE_OLLAMA_API: "false"
       ENABLE_OPENAI_API: "true"
-      OPENAI_API_BASE_URL: ${LLM_BASE_URL}
-      OPENAI_API_KEY: ${LLM_API_KEY}
+      OPENAI_API_BASE_URL: http://vllm-chat:8000/v1
+      OPENAI_API_KEY: local-not-used
 
       # --- RAG ---
       VECTOR_DB: pgvector
       PGVECTOR_DB_URL: postgresql://webui:${POSTGRES_PASSWORD}@pgvector:5432/webui
       RAG_EMBEDDING_ENGINE: openai
       RAG_EMBEDDING_MODEL: ${EMBED_SERVED_NAME:-bge-m3}
-      RAG_OPENAI_API_BASE_URL: ${EMBED_BASE_URL}
-      RAG_OPENAI_API_KEY: ${EMBED_API_KEY}
+      RAG_OPENAI_API_BASE_URL: http://tei-embed:80/v1
+      RAG_OPENAI_API_KEY: local-not-used
       ENABLE_RAG_HYBRID_SEARCH: "true"
       RAG_RERANKING_MODEL: /models/${RERANK_DIR}
       CHUNK_SIZE: ${RAG_CHUNK_SIZE:-1000}

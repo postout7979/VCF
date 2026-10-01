@@ -81,7 +81,7 @@ def main():
     ap.add_argument("--email", required=True)
     ap.add_argument("--password", required=True)
     ap.add_argument("--docs", default="docs_src")
-    ap.add_argument("--base-model", default="vcf-llm", help="LLM_SERVED_NAME (또는 PAIS 모델명)")
+    ap.add_argument("--base-model", default="vcf-llm", help="LLM_SERVED_NAME")
     ap.add_argument("--prompt", default="prompts/system_prompt_ko.txt")
     a = ap.parse_args()
     base = a.url.rstrip("/")
