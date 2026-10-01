@@ -1,0 +1,142 @@
+# VCF 운영 어시스턴트 PoC (조회 전용 RAG, 폐쇄망)
+#
+#   LLM 서빙 + 임베딩 + Open WebUI(RAG/UI) + PGVector
+#   - 기본:   docker compose --profile local-llm --profile local-embed up -d
+#   - PAIS 엔드포인트 사용(LLM/임베딩을 PAIS 에 위임):  docker compose up -d   (profile 없이)
+#
+name: vcf-ai-assistant
+
+x-offline-env: &offline-env
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  HF_HOME: /tmp/hf
+
+services:
+  vllm-chat:
+    profiles: ["local-llm"]
+    image: vllm/vllm-openai:${VLLM_TAG:-latest}
+    restart: unless-stopped
+    ipc: host
+    environment:
+      <<: *offline-env
+    command: >
+      --model /models/${LLM_DIR}
+      --served-model-name ${LLM_SERVED_NAME:-vcf-llm}
+      --max-model-len ${LLM_MAX_LEN:-32768}
+      --gpu-memory-utilization ${LLM_GPU_UTIL:-0.90}
+      --max-num-seqs ${LLM_MAX_SEQS:-16}
+      --tensor-parallel-size ${LLM_TP:-1}
+      --host 0.0.0.0 --port 8000
+    volumes:
+      - ./models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${LLM_TP:-1}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    networks: [backend]
+
+  # 임베딩(bge-m3). 10명 규모는 CPU 로 충분. GPU 사용 시 TEI_IMAGE 태그 변경.
+  tei-embed:
+    profiles: ["local-embed"]
+    image: ${TEI_IMAGE}
+    restart: unless-stopped
+    command: >
+      --model-id /models/${EMBED_DIR}
+      --port 80
+    volumes:
+      - ./models:/models:ro
+    networks: [backend]
+
+  pgvector:
+    image: ${PGVECTOR_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: webui
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: webui
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webui -d webui"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OPENWEBUI_TAG:-main}
+    restart: unless-stopped
+    depends_on:
+      pgvector:
+        condition: service_healthy
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - webui-data:/app/backend/data
+      # 로컬 리랭커 모델(sentence-transformers) 마운트
+      - ./models/${RERANK_DIR}:/models/${RERANK_DIR}:ro
+    environment:
+      <<: *offline-env
+      OFFLINE_MODE: "true"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD}
+      DEFAULT_LOCALE: ko
+      DATABASE_URL: postgresql://webui:${POSTGRES_PASSWORD}@pgvector:5432/webui
+
+      # --- LLM 백엔드 (로컬 vLLM 또는 PAIS Model Endpoint) ---
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: ${LLM_BASE_URL}
+      OPENAI_API_KEY: ${LLM_API_KEY}
+
+      # --- RAG ---
+      VECTOR_DB: pgvector
+      PGVECTOR_DB_URL: postgresql://webui:${POSTGRES_PASSWORD}@pgvector:5432/webui
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_EMBEDDING_MODEL: ${EMBED_SERVED_NAME:-bge-m3}
+      RAG_OPENAI_API_BASE_URL: ${EMBED_BASE_URL}
+      RAG_OPENAI_API_KEY: ${EMBED_API_KEY}
+      ENABLE_RAG_HYBRID_SEARCH: "true"
+      RAG_RERANKING_MODEL: /models/${RERANK_DIR}
+      CHUNK_SIZE: ${RAG_CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP: ${RAG_CHUNK_OVERLAP:-150}
+      RAG_TOP_K: ${RAG_TOP_K:-8}
+      RAG_TOP_K_RERANKER: ${RAG_TOP_K_RERANKER:-4}
+      RAG_RELEVANCE_THRESHOLD: ${RAG_RELEVANCE_THRESHOLD:-0.1}
+
+      # --- 조회 전용 / 폐쇄망 하드닝: 외부 통신, 실행, 도구 기능 비활성 ---
+      ENABLE_SIGNUP: "false"
+      ENABLE_RAG_WEB_SEARCH: "false"
+      ENABLE_CODE_EXECUTION: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_IMAGE_GENERATION: "false"
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_MESSAGE_RATING: "false"
+      # 보조 LLM 호출(제목/태그/자동완성) 비활성: GPU 낭비 방지
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "true"
+      ANONYMIZED_TELEMETRY: "false"
+    networks: [backend, frontend]
+
+networks:
+  backend:
+    internal: true   # 외부 통신 차단
+  frontend: {}
+
+volumes:
+  pgdata:
+  webui-data:
